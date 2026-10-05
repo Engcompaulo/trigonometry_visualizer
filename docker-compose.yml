@@ -1,0 +1,20 @@
+# Trigonometry Visualizer - two-service stack (Req 5.2, 5.3, 5.4)
+services:
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

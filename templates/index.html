@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trigonometry Visualizer</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <h1>Trigonometry Visualizer</h1>
+        <p class="tagline">
+          Pick a concept to render its figure, read the formula, and get a
+          plain-English explanation.
+        </p>
+      </header>
+
+      <!-- Concept selection: dropdown of the five supported concepts plus a
+           free-text input. Both resolve through the same server-side
+           normalization, so either control can drive a render. -->
+      <section class="controls" aria-label="Concept selection">
+        <form id="concept-form" class="concept-form" autocomplete="off">
+          <div class="field">
+            <label for="concept-select">Choose a concept</label>
+            <select id="concept-select" name="concept-select">
+              <option value="" selected>Select a concept…</option>
+              {% for concept in supported %}
+              <option value="{{ concept }}">{{ concept }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="concept-input">Or type a concept</label>
+            <input
+              id="concept-input"
+              name="concept-input"
+              type="text"
+              maxlength="100"
+              placeholder="e.g. sine, unit circle"
+            />
+          </div>
+
+          <div class="field field-actions">
+            <button type="submit" id="render-button" class="primary">
+              Render figure
+            </button>
+          </div>
+        </form>
+
+        <!-- Error / status messages are shown here (invalid input, render
+             failure). The submitted input is preserved on error. -->
+        <p id="status-message" class="status-message" role="alert" hidden></p>
+      </section>
+
+      <!-- Result area. Empty state until the first successful render. -->
+      <section class="result" aria-label="Figure and formula" id="result-area">
+        <div class="figure-wrap">
+          <img id="figure-image" alt="" hidden />
+          <p id="empty-state" class="empty-state">
+            No figure yet. Select or type a concept, then render it.
+          </p>
+        </div>
+
+        <!-- Formula caption, shown adjacent to the figure (Req 2.5). -->
+        <p id="formula-caption" class="formula-caption" hidden></p>
+
+        <div class="result-actions">
+          <!-- Download points at the same /render endpoint with download=1.
+               Disabled until a figure exists (Req 3.4). -->
+          <a
+            id="download-link"
+            class="button secondary disabled"
+            role="button"
+            aria-disabled="true"
+            download
+            >Download PNG</a
+          >
+          <!-- Explain triggers the Ollama-backed explanation (Req 4). -->
+          <button type="button" id="explain-button" class="secondary" disabled>
+            Explain
+          </button>
+        </div>
+      </section>
+
+      <!-- Explanation area with a loading indicator (Req 4.2, 4.3). -->
+      <section class="explanation" aria-label="Explanation" id="explanation-area" hidden>
+        <h2>Explanation</h2>
+        <div id="explanation-loading" class="loading" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Generating a plain-English explanation…</span>
+        </div>
+        <p id="explanation-text" class="explanation-text"></p>
+      </section>
+    </main>
+
+    <script>
+      (function () {
+        "use strict";
+
+        // Canonical concept name -> formula text, injected by the server so the
+        // page can show the formula adjacent to the figure (Req 2.5). Keys are
+        // the canonical (lowercased) names used by server-side normalization.
+        var FORMULAS = {{ formulas | tojson }};
+
+        function formulaFor(concept) {
+          var key = concept.trim().toLowerCase().replace(/\s+/g, " ");
+          return FORMULAS[key] || "";
+        }
+
+        var form = document.getElementById("concept-form");
+        var select = document.getElementById("concept-select");
+        var textInput = document.getElementById("concept-input");
+        var renderButton = document.getElementById("render-button");
+        var statusMessage = document.getElementById("status-message");
+
+        var figureImage = document.getElementById("figure-image");
+        var emptyState = document.getElementById("empty-state");
+        var formulaCaption = document.getElementById("formula-caption");
+        var downloadLink = document.getElementById("download-link");
+        var explainButton = document.getElementById("explain-button");
+
+        var explanationArea = document.getElementById("explanation-area");
+        var explanationLoading = document.getElementById("explanation-loading");
+        var explanationText = document.getElementById("explanation-text");
+
+        // The concept backing the figure currently on screen. Null until a
+        // figure exists; used to gate download and explain.
+        var currentConcept = null;
+
+        function showStatus(message) {
+          statusMessage.textContent = message;
+          statusMessage.hidden = false;
+        }
+
+        function clearStatus() {
+          statusMessage.textContent = "";
+          statusMessage.hidden = true;
+        }
+
+        // Resolve the concept to render: prefer the dropdown, fall back to the
+        // text input. Server-side normalization handles case/whitespace.
+        function selectedConcept() {
+          var fromSelect = select.value.trim();
+          if (fromSelect) {
+            return fromSelect;
+          }
+          return textInput.value.trim();
+        }
+
+        function enableResultActions(concept) {
+          currentConcept = concept;
+          downloadLink.href =
+            "/render?concept=" + encodeURIComponent(concept) + "&download=1";
+          downloadLink.classList.remove("disabled");
+          downloadLink.setAttribute("aria-disabled", "false");
+          explainButton.disabled = false;
+        }
+
+        function disableResultActions() {
+          currentConcept = null;
+          downloadLink.removeAttribute("href");
+          downloadLink.classList.add("disabled");
+          downloadLink.setAttribute("aria-disabled", "true");
+          explainButton.disabled = true;
+        }
+
+        function hideExplanation() {
+          explanationArea.hidden = true;
+          explanationLoading.hidden = true;
+          explanationText.textContent = "";
+        }
+
+        // Render a concept: validate server-side via /render, then set the
+        // image source. On error, preserve input and show the message.
+        function renderConcept(concept) {
+          clearStatus();
+          renderButton.disabled = true;
+
+          var url = "/render?concept=" + encodeURIComponent(concept);
+
+          fetch(url)
+            .then(function (response) {
+              if (response.ok) {
+                return response.blob().then(function (blob) {
+                  var objectUrl = URL.createObjectURL(blob);
+                  var previous = figureImage.getAttribute("data-object-url");
+                  if (previous) {
+                    URL.revokeObjectURL(previous);
+                  }
+                  figureImage.src = objectUrl;
+                  figureImage.setAttribute("data-object-url", objectUrl);
+                  figureImage.alt = "Figure for " + concept;
+                  figureImage.hidden = false;
+                  emptyState.hidden = true;
+
+                  formulaCaption.hidden = false;
+                  var formula = formulaFor(concept);
+                  formulaCaption.textContent = formula
+                    ? concept + " — " + formula
+                    : "Rendered concept: " + concept;
+
+                  enableResultActions(concept);
+                  hideExplanation();
+                });
+              }
+
+              // Non-OK: the route returns a 400 JSON error listing the five
+              // supported concepts. Keep the previous figure and input.
+              return response
+                .json()
+                .catch(function () {
+                  return {};
+                })
+                .then(function (data) {
+                  var message =
+                    data && data.error
+                      ? data.error
+                      : "That concept could not be rendered. Choose a supported concept.";
+                  showStatus(message);
+                });
+            })
+            .catch(function () {
+              showStatus(
+                "Figure generation failed. Please check your connection and try again."
+              );
+            })
+            .finally(function () {
+              renderButton.disabled = false;
+            });
+        }
+
+        form.addEventListener("submit", function (event) {
+          event.preventDefault();
+          var concept = selectedConcept();
+          if (!concept) {
+            showStatus(
+              "A concept from the supported list is required. Select or type one of: " +
+                "sine, cosine, tangent, right triangle, unit circle."
+            );
+            return;
+          }
+          renderConcept(concept);
+        });
+
+        // Keep the dropdown and text input loosely in sync: picking from the
+        // dropdown fills the text input so the submitted value is visible.
+        select.addEventListener("change", function () {
+          if (select.value) {
+            textInput.value = select.value;
+          }
+        });
+
+        // Prevent navigation when the download control is disabled (Req 3.4).
+        downloadLink.addEventListener("click", function (event) {
+          if (!currentConcept || downloadLink.classList.contains("disabled")) {
+            event.preventDefault();
+            showStatus("No figure is available to download yet.");
+          }
+        });
+
+        // Request a plain-English explanation. Shows a spinner, and renders the
+        // fallback message when the service reports available:false (Req 4.3).
+        explainButton.addEventListener("click", function () {
+          if (!currentConcept) {
+            showStatus("Render a figure before requesting an explanation.");
+            return;
+          }
+
+          explanationArea.hidden = false;
+          explanationLoading.hidden = false;
+          explanationText.textContent = "";
+          explainButton.disabled = true;
+
+          var url = "/explain?concept=" + encodeURIComponent(currentConcept);
+
+          fetch(url)
+            .then(function (response) {
+              return response.json();
+            })
+            .then(function (data) {
+              // available:false renders the friendly fallback message as-is.
+              explanationText.textContent =
+                data && data.explanation
+                  ? data.explanation
+                  : "The explanation is unavailable right now. The figure, formula, and download still work.";
+            })
+            .catch(function () {
+              explanationText.textContent =
+                "The explanation is unavailable right now. The figure, formula, and download still work.";
+            })
+            .finally(function () {
+              explanationLoading.hidden = true;
+              explainButton.disabled = false;
+            });
+        });
+
+        // Start in the empty state with actions disabled.
+        disableResultActions();
+      })();
+    </script>
+  </body>
+</html>
